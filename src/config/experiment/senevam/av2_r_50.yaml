@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - override /data: av2
+  - override /model: senevam
+  - _self_
+
+data:
+  radius: 10
+  batch_size: 4
+
+tags:
+  - senevam
+  - av2
+  - radius_50

@@ -1,0 +1,75 @@
+Metadata-Version: 2.4
+Name: planner
+Version: 0.0.1
+Summary: Extending probabilistic motion prediction with planning module.
+Author-email: Juanwu Lu <juanwu@purdue.edu>
+License: MIT License
+        
+        Copyright (c) 2025 Juanwu Lu and Purdue Digital Twin Lab
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Project-URL: repository, https://github.com/juanwulu/graph-motion-prediction
+Requires-Python: ==3.10.*
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: av2@ git+https://github.com/argoverse/av2-api
+Requires-Dist: gitpython>=3.1.0
+Requires-Dist: hydra-core==1.3.*
+Requires-Dist: hydra-colorlog>=1.2.0
+Requires-Dist: lightning>=2.3.1
+Requires-Dist: rich>=13.7.1
+Requires-Dist: tensorboard
+Requires-Dist: torch>=2.3.0
+Requires-Dist: torchmetrics>=0.11.0
+Provides-Extra: dev
+Requires-Dist: pre-commit<4.0.0; extra == "dev"
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-cov; extra == "dev"
+Requires-Dist: torch_tb_profiler; extra == "dev"
+Provides-Extra: notebook
+Requires-Dist: ipykernel; extra == "notebook"
+Requires-Dist: ipympl; extra == "notebook"
+Requires-Dist: ipywidgets; extra == "notebook"
+Dynamic: license-file
+
+# Extending Probabilistic Motion Prediction Models with Planning Module
+
+## Getting Started
+
+### Prepare Environment
+
+The implementation of SeNeVA requires Python 3.10, PyTorch 2.0+ and Lightning 2.0+. If you are using Anaconda/Miniconda environment, you can create the virtual environment by running the following line inside the root directory:
+
+```bash
+$ conda env create -f conda/environment.yaml
+Channels:
+ - conda-forge
+ - defaults
+ - base
+Platform: linux-64
+Collecting package metadata (repodata.json): done
+Solving environment: done
+
+Downloading and Extracting Packages:
+
+Preparing transaction: done
+Verifying transaction: done
+Executing transaction: done
+```

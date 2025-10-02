@@ -1,0 +1,11 @@
+_target_: planner.data.datamodule.AV2DataModule
+_convert_: all
+
+batch_size: 32
+root: ${paths.root_dir}/data/av2
+num_workers: 8
+pin_memory: false
+radius: null
+train: true
+val: true
+test: false
