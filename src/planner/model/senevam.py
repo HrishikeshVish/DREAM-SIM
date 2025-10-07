@@ -27,6 +27,20 @@ from planner.model.function.geometry import wrap_angles
 from planner.model.function.mask import extract_target
 from planner.model.module.layers import linear
 from planner.utils.logging import get_logger
+from planner.model.components.constraints_loss import DifferentiableConstraintLosses
+
+from planner.model.components.constraint_models import (
+    ConstraintPosteriorNetwork,
+    ConstraintPriorNetwork,
+    PotentialFieldNetwork
+)
+
+# Assume this is the file you've copied from the CCDiff repository
+# We will import the specific loss classes we want to adapt
+from your_project.third_party.ccdiff import AgentCollisionLoss, TargetSpeedLoss
+
+# Assume this is the adapter function we designed previously
+from your_project.utils.adapters import create_ccdiff_databatch
 
 import torch.nn.functional as F
 
@@ -200,7 +214,28 @@ class SeNeVAMLightningModule(LightningModule):
             init_scale=init_scale,
             output_size=5,  # NOTE: dxy, dyaw, dvel
         )
-        # --- 2. SDE & GENERATIVE COMPONENTS ---
+        # --- 2. Constraint Posterior Definitions ---
+        self.constraint_posterior_net = ConstraintPosteriorNetwork(
+            hidden_size=hidden_size,
+            latent_c_dim=32,  # Must be the same as the prior network's
+            num_heads=num_heads
+        )
+        self.constraint_prior_net = ConstraintPriorNetwork(
+            hidden_size=hidden_size,
+            latent_c_dim=32,  # A new hyperparameter for your model
+            num_heads=num_heads
+        )
+
+        self.potential_field_net = PotentialFieldNetwork(
+            hidden_size=hidden_size,
+            latent_c_dim=32,         # Must match the other two networks
+            traj_state_dim=5,        # The feature dimension of your predicted trajectory Y
+            num_encoder_layers=3,    # Similar to `num_blocks` in your HistoryEncoder
+            num_heads=num_heads
+        )
+
+        self.constraint_losses = DifferentiableConstraintLosses()
+        self.beta = 1.0
 
         
 
@@ -268,6 +303,21 @@ class SeNeVAMLightningModule(LightningModule):
             properties=scenario.object_property,
             current_time=scenario.current_time_step,
         )
+
+        _, x_future_gt = self.encoder(
+            map_point=scenario.map_point,
+            trajectory=scenario.log_trajectory,
+            properties=scenario.object_property,
+            # Pass future timesteps to the encoder
+            current_time=[scenario.current_time_step + 1, scenario.current_time_step + horizon],
+        )
+
+        q_c_dist = self.constraint_posterior_net(x_traj, x_future_gt)
+        p_c_dist = self.constraint_prior_net(x_traj)
+        c_sample = q_c_dist.rsample()
+
+
+
 
         assert x_map is not None and x_traj is not None
         assert torch.isnan(x_map).sum() == 0 and torch.isnan(x_traj).sum() == 0
@@ -379,7 +429,7 @@ class SeNeVAMLightningModule(LightningModule):
         assert horizon > 0
 
         start = time.time()
-        s_mean, s_vars, z_logits, sde_loss, score_loss, sde_metrics = self.policy.forward(
+        s_mean, s_vars, z_logits = self.policy.forward(
             inputs=x_tar,
             tar_xy=rst_tar[..., 0:2],
             tar_yaw=rst_tar[..., 2:3],
@@ -393,7 +443,8 @@ class SeNeVAMLightningModule(LightningModule):
             num_agents = num_agents_in_scene,
             assigned_types = assigned_types,
             scenario = scenario,
-            global_step = self.global_step
+            global_step = self.global_step,
+            constraint_embed = c_sample
         )
         
         assert s_mean is not None and s_vars is not None and z_logits is not None
@@ -429,7 +480,211 @@ class SeNeVAMLightningModule(LightningModule):
             z_logits=z_logits,
             current_state=rst_tar,
             current_valid=tar_valid,
-        ), score_loss, sde_loss, sde_metrics
+            q_c_dist = q_c_dist,
+            p_c_dist = p_c_dist
+        )
+
+
+    def inference(self, scenario, horizon:int, num_samples:int=20, include_sdc:bool=True):
+        
+        obj_type = torch.where(
+            scenario.object_property.valid,
+            scenario.object_property.object_types,
+            torch.full_like(scenario.object_property.object_types, 0),
+        )
+
+        unique_elements, counts = torch.unique(
+            obj_type[0], return_counts=True, sorted=True
+        )
+
+        ct = scenario.current_time_step
+        #print("CURRENT TIME STEP:", ct)
+        #print("Horizons:", horizon)
+        #print("LOG TRAJECTORY SHAPE:", scenario.log_trajectory.shape)
+        # PART 1: ENCODING & TARGET EXTRACTION
+        x_map, x_traj = self.encoder.forward(
+            map_point=scenario.map_point,
+            trajectory=scenario.log_trajectory,
+            properties=scenario.object_property,
+            current_time=scenario.current_time_step,
+        )
+
+        assert x_map is not None and x_traj is not None
+        assert torch.isnan(x_map).sum() == 0 and torch.isnan(x_traj).sum() == 0
+        #Linear interpolation in noise space. Intermediate noise will still yield correct positions.
+        p_c_dist = self.constraint_prior_net(x_traj)
+        c_sample = p_c_dist.sample().permute(1,0,2) # Shape: [B, num_samples, hidden_size]
+
+        assert x_map is not None and x_traj is not None
+        assert torch.isnan(x_map).sum() == 0 and torch.isnan(x_traj).sum() == 0
+        #Linear interpolation in noise space. Intermediate noise will still yield correct positions.
+        #print("ENCODED TRAJECTORY SHAPE:", x_traj.shape)
+        #print("X_TRAJ SAMPLE:", x_traj.shape)
+        
+        is_target = get_target_mask(scenario=scenario, include_sdc=include_sdc)
+        assert is_target is not None
+        assert torch.isnan(is_target).sum() == 0
+        x_tar, tar_valid = extract_target(data=x_traj, mask=is_target)
+        assert x_tar is not None and tar_valid is not None
+        assert torch.isnan(x_tar).sum() == 0 and torch.isnan(tar_valid).sum() == 0
+
+        with torch.no_grad():
+            if(isinstance(ct, int)):
+                rst_traj = torch.cat(
+                    [
+                        scenario.log_trajectory.xy[..., ct, :],
+                        scenario.log_trajectory.yaw[..., ct, None],
+                        scenario.log_trajectory.velocity[..., ct, :],
+                    ],
+                    dim=-1,
+                )
+            elif(isinstance(ct, list)):
+                rst_traj = torch.cat(
+                    [
+                        scenario.log_trajectory.xy[..., ct[0], :],
+                        scenario.log_trajectory.yaw[..., ct[0], None],
+                        scenario.log_trajectory.velocity[..., ct[0], :],
+                    ],
+                    dim=-1,
+                )
+            rst_tar, _ = extract_target(
+                data=rst_traj,
+                mask=is_target,
+            )
+            rst_ctx = torch.cat(
+                [
+                    scenario.map_point.xy,
+                    scenario.map_point.orientation[..., None],
+                ],
+                dim=-1,
+            )
+            ctx_valid = scenario.map_point.valid
+
+        # forward pass the policy network
+        assert x_tar is not None and rst_tar is not None
+        assert torch.isnan(x_tar).sum() == 0 and torch.isnan(rst_tar).sum() == 0
+        assert rst_ctx is not None and ctx_valid is not None
+        assert torch.isnan(rst_ctx).sum() == 0 and torch.isnan(ctx_valid).sum() == 0
+        assert rst_tar is not None and tar_valid is not None
+        assert torch.isnan(rst_tar).sum() == 0 and torch.isnan(tar_valid).sum() == 0
+        assert x_map is not None
+        assert torch.isnan(x_map).sum() == 0
+        assert horizon > 0
+
+        start = time.time()
+        s_mean, s_vars, z_logits= self.policy.forward(
+            inputs=x_tar,
+            tar_xy=rst_tar[..., 0:2],
+            tar_yaw=rst_tar[..., 2:3],
+            tar_valid=tar_valid,
+            context=x_map,
+            ctx_xy=rst_ctx[..., 0:2],
+            ctx_yaw=rst_ctx[..., 2:3],
+            ctx_valid=ctx_valid,
+            horizon=horizon,
+            emission_head = self.emission,
+            num_agents = num_agents_in_scene,
+            assigned_types = assigned_types,
+            scenario = scenario,
+            global_step = self.global_step,
+            constraint_embed = c_sample
+        )
+
+    def _compute_pde_loss(
+        self,
+        model_output: SeNeVAMOutput,
+        c_embed: torch.Tensor,
+        scenario: Scenario
+    ) -> torch.Tensor:
+        """
+        Calculates the PDE residual loss for the PINN framework.
+
+        This function enforces the governing PDE: ∇²Φ = ∇²L, where Φ is the
+        learned potential and L is the guidance loss from constraints.
+        """
+        pde_loss_total = 0.0
+        num_modes = model_output.y_means.size(-3)
+
+        # The PINN loss must apply to all plausible futures (modes) the model predicts
+        for i in range(num_modes):
+            # 1. Get the mean trajectory for the current mode
+            # This is the "answer" from the student (main model) that the teacher (PINN) will check
+            Y_i = model_output.y_means[..., i, :, :]
+            Y_i.requires_grad_(True)  # Crucial for computing gradients w.r.t. the trajectory
+
+            # 2. Calculate the LHS of the PDE: ∇²Φ
+            # Evaluate the potential field's energy for this trajectory
+            self.potential_field_net.train()  # Ensure the network is in training mode for autograd
+            phi_val = self.potential_field_net(Y_i, c_embed)
+            # Compute the Laplacian of the potential field
+            laplacian_phi = self._compute_laplacian(phi_val, Y_i)
+
+            # 3. Calculate the RHS of the PDE: f = ∇²L
+            # First, get the scalar guidance loss L(Y;c)
+            guidance_loss = self.constraint_losses(
+                Y=Y_i,
+                scenario=scenario
+                # c_config can be passed here if needed, e.g., for weights
+            )
+            # Then, compute its Laplacian to get the source term
+            source_term_f = self._compute_laplacian(guidance_loss, Y_i)
+
+            # 4. Compute the residual
+            # The residual is the difference between the two sides of the PDE.
+            # A perfect solution would have a residual of zero.
+            residual = laplacian_phi - source_term_f
+            
+            # 5. Accumulate the squared error loss
+            # We penalize the mean squared residual to drive it to zero.
+            pde_loss_total += torch.mean(residual**2)
+
+        # Average the loss over all modes
+        return pde_loss_total / num_modes
+
+    def _compute_laplacian(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the Laplacian of a scalar output `y` w.r.t. a tensor input `x`.
+        
+        Laplacian(y) = sum over all elements of x (∂²y / ∂xᵢ²)
+
+        Args:
+            y: Scalar tensor, output of a function (e.g., potential or loss). Shape: [B, 1]
+            x: Tensor input to the function. Shape: [B, ...]
+
+        Returns:
+            Scalar tensor representing the Laplacian. Shape: [B]
+        """
+        # First, compute the gradient of y w.r.t. x (the Jacobian)
+        grad_y = torch.autograd.grad(
+            outputs=y,
+            inputs=x,
+            grad_outputs=torch.ones_like(y),
+            create_graph=True  # create_graph=True is essential for second-order derivatives
+        )[0]
+
+        # Flatten the gradient and input for easier iteration
+        grad_y_flat = grad_y.view(grad_y.size(0), -1)
+        x_flat = x.view(x.size(0), -1)
+
+        # Compute the second derivatives (diagonals of the Hessian)
+        # NOTE: This loop-based implementation is clear but can be slow for very high
+        # dimensional inputs. For production, this can be optimized using
+        # functorch or by computing Hessian-vector products.
+        laplacian = 0.0
+        for i in range(grad_y_flat.size(1)):
+            # Compute the gradient of the i-th element of the first gradient
+            # w.r.t. the full input vector x
+            grad2_i = torch.autograd.grad(
+                outputs=grad_y_flat[:, i],
+                inputs=x_flat,
+                grad_outputs=torch.ones_like(grad_y_flat[:, i]),
+                create_graph=True
+            )[0]
+            # We only need the diagonal term ∂²y/∂xᵢ², which is the i-th element
+            laplacian += grad2_i[:, i]
+            
+        return laplacian     
+
 
 
     # =========================================================================
@@ -542,7 +797,7 @@ class SeNeVAMLightningModule(LightningModule):
         target, valid = self.get_target(scenario=batch)
         horizon = target.size(-2)
 
-        output, loss_sde, loss_sde_recon, sde_metrics = self.forward(scenario=batch, horizon=horizon)
+        output = self.forward(scenario=batch, horizon=horizon)
         losses = self._compute_losses(
             y_obs=target,
             valid=valid,
@@ -552,10 +807,15 @@ class SeNeVAMLightningModule(LightningModule):
             # NOTE: only train proxy network after training generative model
             train_proxy=self.global_step
             >= 0.5 * self.optimizer_config.total_steps,
-            loss_sde=loss_sde,
-            loss_sde_recon=loss_sde_recon,
-            sde_metrics=sde_metrics
+            q_c_dist=output.q_c_dist,
+            p_c_dist=output.p_c_dist
         )
+        pde_loss = self._compute_pde_loss(
+            model_output=output,
+            scenario=batch # Pass the full scenario for context
+        )
+        losses = losses + self.beta * pde_loss
+        losses["pde_loss"] = pde_loss.item()
         _batch_time = time.monotonic() - _start_time
 
         # Log training status
@@ -630,11 +890,14 @@ class SeNeVAMLightningModule(LightningModule):
         y_means: torch.Tensor,
         y_covar: torch.Tensor,
         z_logits: torch.Tensor,
-        train_proxy: bool = False,
-        loss_sde: torch.Tensor = None,
-        loss_sde_recon: torch.Tensor = None,
-        sde_metrics: Dict =None
+        # MODIFIED: Add the distributions for the latent constraint `c` to the signature
+        q_c_dist: D.Distribution,
+        p_c_dist: D.Distribution,
+        train_proxy: bool = False
     ) -> Dict[str, torch.Tensor]:
+        
+        # --- Steps 1-4 are your original logic for the intention `z` ---
+
         # step 1: evaluate the variational distribution q(z)
         log_pdf = []
         for i in range(y_means.size(-3)):
@@ -645,8 +908,8 @@ class SeNeVAMLightningModule(LightningModule):
                         y_means=y_means[..., i, :, :],
                         y_covar=y_covar[..., i, :, :, :],
                     )
-                    * valid.float(),  # NOTE: mask out invalid predictions
-                    dim=-1,  # NOTE: sum over the temporal dimension
+                    * valid.float(),
+                    dim=-1,
                 )
             )
         log_pdf = torch.stack(log_pdf, dim=-1)
@@ -658,7 +921,7 @@ class SeNeVAMLightningModule(LightningModule):
         # step 2: calculate the reconstruction loss
         loss = -torch.sum(log_q_z.exp() * log_pdf, dim=-1)
 
-        # step 3: compute the KL divergence
+        # step 3: compute the KL divergence for z
         with torch.no_grad():
             kl_div_z = torch.sum(log_q_z.exp() * log_q_z, dim=-1).neg()
 
@@ -666,30 +929,35 @@ class SeNeVAMLightningModule(LightningModule):
         targets = nn.functional.one_hot(
             log_q_z.argmax(dim=-1), num_classes=log_q_z.size(-1)
         ).float()
-        cross_entropy = -targets * nn.functional.log_softmax(z_logits, dim=-1)
-        pt = torch.sum(
-            nn.functional.softmax(z_logits, dim=-1) * targets,
-            dim=-1,
-            keepdim=False,
-        )
+        cross_entropy = -targets * F.log_softmax(z_logits, dim=-1)
+        pt = torch.sum(F.softmax(z_logits, dim=-1) * targets, dim=-1)
         focal_weight = torch.pow(1 - pt, exponent=self.gamma)
         if self.alpha is not None:
             cross_entropy = self.alpha * cross_entropy
         z_proxy_loss = torch.sum(
             focal_weight.unsqueeze(-1) * cross_entropy, dim=-1
         )
-        loss = loss + float(train_proxy) * z_proxy_loss + loss_sde.mean() + loss_sde_recon.mean()
+        
+        # --- NEW: Step 5 adds the KL divergence for the constraint `c` ---
 
+        # step 5: calculate the KL divergence for the latent constraint c
+        # This term regularizes the constraint embedding space.
+        kl_div_c = D.kl.kl_divergence(q_c_dist, p_c_dist)
+
+        # --- Combine all losses ---
+        
+        # MODIFIED: Add the original losses and the new, weighted kl_div_c
+        # Note: You will need to add `self.kl_c_weight` as a hyperparameter
+        #       in your model's __init__ (e.g., self.kl_c_weight = 0.1)
+        loss = loss + float(train_proxy) * z_proxy_loss + self.kl_c_weight * kl_div_c
+        
+        # MODIFIED: Add kl_div_c to the returned dictionary for logging
         return {
             "loss": loss[valid.any(dim=-1)].mean(),
-            "reconstruction": loss[valid.any(dim=-1)].mean().item(),
-            "kl_div_z": kl_div_z[valid.any(dim=-1)].mean().item(),
-            "z_proxy": z_proxy_loss[valid.any(dim=-1)].mean().item(),
-            "sde_score_loss": loss_sde.mean().item(),
-            "sde_recon_loss": loss_sde_recon.mean().item(),
-            "sde_to_lstm_mse": sde_metrics["sde_to_lstm_mse"],
-            "sde_to_noisy_cosine": sde_metrics["sde_to_noisy_cosine"],
-            "noisy_to_lstm_cosine": sde_metrics["noisy_to_lstm_cosine"],
+            "reconstruction": loss[valid.any(dim=-1)].mean().detach(),
+            "kl_div_z": kl_div_z[valid.any(dim=-1)].mean().detach(),
+            "kl_div_c": kl_div_c[valid.any(dim=-1)].mean().detach(), # New log item
+            "z_proxy": z_proxy_loss[valid.any(dim=-1)].mean().detach(),
         }
 
     # =========================================================================

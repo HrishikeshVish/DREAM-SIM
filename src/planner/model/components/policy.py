@@ -25,454 +25,17 @@ TIKHONOV_REGULARIZATION = 0.5 / math.pi
 
 from torch.nn.utils import weight_norm
 
-class GaussianFourierProjection(nn.Module):
-    """Gaussian Fourier features for encoding time."""
-    def __init__(self, embedding_size=256, scale=1.0):
+class FiLMLayer(nn.Module):
+    """A Feature-wise Linear Modulation layer."""
+    def __init__(self, channels: int, cond_channels: int):
         super().__init__()
-        self.W = nn.Parameter(torch.randn(embedding_size) * scale, requires_grad=False)
+        self.gammas = nn.Linear(cond_channels, channels)
+        self.betas = nn.Linear(cond_channels, channels)
 
-    def forward(self, t):
-        t_proj = t.view(-1, 1) * self.W.view(1, -1) * 2 * math.pi
-        return torch.cat([torch.sin(t_proj), torch.cos(t_proj)], dim=-1)
-
-class ResnetBlockDDPM1d(nn.Module):
-    """ResNet block adapted for 1D sequences."""
-    def __init__(self, in_ch, out_ch=None, temb_dim=None, dropout=0.1):
-        super().__init__()
-        out_ch = out_ch or in_ch
-        self.norm1 = nn.GroupNorm(16, in_ch)
-        self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size=3, stride=1, padding=1)
-        
-        self.temb_proj = None
-        if temb_dim is not None:
-            self.temb_proj = nn.Linear(temb_dim, out_ch)
-
-        self.norm2 = nn.GroupNorm(16, out_ch)
-        self.dropout = nn.Dropout(dropout)
-        self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size=3, stride=1, padding=1)
-        
-        self.nin_shortcut = nn.Conv1d(in_ch, out_ch, kernel_size=1) if in_ch != out_ch else nn.Identity()
-        self.act = nn.SiLU()
-
-    def forward(self, x, temb):
-        h = x
-        h = self.norm1(h)
-        h = self.act(h)
-        h = self.conv1(h)
-        
-        if self.temb_proj is not None:
-            h += self.temb_proj(self.act(temb))[:, :, None]
-
-        h = self.norm2(h)
-        h = self.act(h)
-        h = self.dropout(h)
-        h = self.conv2(h)
-
-        return h + self.nin_shortcut(x)
-
-class AttnBlock1d(nn.Module):
-    """Self-attention block for 1D sequences."""
-    def __init__(self, in_ch):
-        super().__init__()
-        self.norm = nn.GroupNorm(16, in_ch)
-        self.q = nn.Conv1d(in_ch, in_ch, 1)
-        self.k = nn.Conv1d(in_ch, in_ch, 1)
-        self.v = nn.Conv1d(in_ch, in_ch, 1)
-        self.proj_out = nn.Conv1d(in_ch, in_ch, 1)
-
-    def forward(self, x):
-        h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        b, c, l = q.shape
-        q = q.permute(0, 2, 1) # B, L, C
-        k = k.view(b, c, l) # B, C, L
-        w_ = torch.bmm(q, k)
-        w_ = w_ * (int(c) ** (-0.5))
-        w_ = F.softmax(w_, dim=-1)
-
-        w_ = w_.permute(0, 2, 1) # B, L, L
-        h_ = torch.bmm(v, w_)
-        h_ = h_.view(b, c, l)
-
-        return x + self.proj_out(h_)
-
-class Downsample1d(nn.Module):
-    def __init__(self, in_ch, with_conv):
-        super().__init__()
-        self.with_conv = with_conv
-        if self.with_conv:
-            self.conv = nn.Conv1d(in_ch, in_ch, kernel_size=3, stride=2, padding=1)
-
-    def forward(self, x):
-        if self.with_conv:
-            return self.conv(x)
-        else:
-            return F.avg_pool1d(x, kernel_size=2, stride=2)
-
-class Upsample1d(nn.Module):
-    def __init__(self, in_ch, with_conv):
-        super().__init__()
-        self.with_conv = with_conv
-        if self.with_conv:
-            self.conv = nn.Conv1d(in_ch, in_ch, kernel_size=3, stride=1, padding=1)
-
-    def forward(self, x, target_size):
-        # Use `size` argument instead of `scale_factor` to ensure exact match
-        x = F.interpolate(x, size=target_size, mode='linear', align_corners=False)
-        if self.with_conv:
-            x = self.conv(x)
-        return x
-
-
-# =====================================================================================
-# == The Main NCSNpp Class (Adapted for 1D Trajectories)
-# =====================================================================================
-
-class NCSNpp(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-        self.act = nn.SiLU()
-        
-        self.nf = config['nf']
-        ch_mult = config['ch_mult']
-        self.num_res_blocks = config['num_res_blocks']
-        self.attn_resolutions = config['attn_resolutions']
-        dropout = config['dropout']
-        resamp_with_conv = config['resamp_with_conv']
-        self.num_resolutions = len(ch_mult)
-        
-        self.time_embedding = GaussianFourierProjection(embedding_size=self.nf)
-        self.temb_dense1 = nn.Linear(self.nf * 2, self.nf * 4)
-        self.temb_dense2 = nn.Linear(self.nf * 4, self.nf * 4)
-
-        # Downsampling path
-        self.conv_in = nn.Conv1d(config['latent_dim'], self.nf, kernel_size=3, stride=1, padding=1)
-        self.down_blocks = nn.ModuleList()
-        hs_channels = [self.nf]
-        in_ch = self.nf
-        
-        for i_level in range(self.num_resolutions):
-            out_ch = self.nf * ch_mult[i_level]
-            for _ in range(self.num_res_blocks):
-                self.down_blocks.append(ResnetBlockDDPM1d(in_ch, out_ch=out_ch, temb_dim=self.nf * 4, dropout=dropout))
-                in_ch = out_ch
-                hs_channels.append(in_ch)
-            if i_level != self.num_resolutions - 1:
-                self.down_blocks.append(Downsample1d(in_ch, resamp_with_conv))
-                hs_channels.append(in_ch)
-
-        # Bottleneck
-        self.mid_block1 = ResnetBlockDDPM1d(in_ch, temb_dim=self.nf * 4, dropout=dropout)
-        self.mid_attn = AttnBlock1d(in_ch)
-        self.mid_block2 = ResnetBlockDDPM1d(in_ch, temb_dim=self.nf * 4, dropout=dropout)
-
-        # Upsampling path
-        self.up_blocks = nn.ModuleList()
-        for i_level in reversed(range(self.num_resolutions)):
-            out_ch = self.nf * ch_mult[i_level]
-            for _ in range(self.num_res_blocks + 1):
-                self.up_blocks.append(ResnetBlockDDPM1d(in_ch + hs_channels.pop(), out_ch=out_ch, temb_dim=self.nf * 4, dropout=dropout))
-                in_ch = out_ch
-            if i_level != 0:
-                self.up_blocks.append(Upsample1d(in_ch, resamp_with_conv))
-        
-        self.norm_out = nn.GroupNorm(16, in_ch)
-        self.conv_out = nn.Conv1d(in_ch, config['latent_dim'], kernel_size=3, stride=1, padding=1)
-
-    def forward(self, z_t, t, context_token=None, key_padding_mask=None):
-        x = z_t.permute(0, 2, 1)
-
-        temb = self.time_embedding(t)
-        temb = self.temb_dense1(temb)
-        temb = self.act(temb)
-        temb = self.temb_dense2(temb)
-
-        # Downsampling
-        h = self.conv_in(x)
-        hs = [h]
-        for module in self.down_blocks:
-            h = module(h, temb) if isinstance(module, ResnetBlockDDPM1d) else module(h)
-            hs.append(h)
-        
-        # Bottleneck
-        h = self.mid_block1(h, temb)
-        h = self.mid_attn(h)
-        h = self.mid_block2(h, temb)
-        
-        # Upsampling
-        for module in self.up_blocks:
-            if isinstance(module, ResnetBlockDDPM1d):
-                skip = hs.pop()
-                h = torch.cat([h, skip], dim=1)
-                h = module(h, temb)
-            else: # Upsample1d
-                target_size = hs[-1].shape[-1]
-                h = module(h, target_size)
-                
-        # Final
-        h = self.norm_out(h)
-        h = self.act(h)
-        h = self.conv_out(h)
-
-        return h.permute(0, 2, 1)
-
-class GatingNetwork(nn.Module):
-    def __init__(self, context_dim: int, num_energy_terms: int = 3):
-        super().__init__()
-        self.num_energy_terms = num_energy_terms
-        self.net = nn.Sequential(
-            nn.Linear(context_dim*10, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.num_energy_terms)
-        )
-
-    def forward(self, context: torch.Tensor, num_scenes: int, num_agents: int, num_intentions: int) -> torch.Tensor:
-        
-        context = context.view(-1, context.shape[-1]*context.shape[-2])
-        logits_flat = self.net(context)
-
-        #print(num_scenes, num_agents, num_intentions)
-
-        logits = logits_flat.view(num_scenes, num_agents, num_intentions, self.num_energy_terms)
-        #print("Logits Shape: ", logits.shape)
-        weights = F.softmax(logits, dim=-1)
-        return weights
-    
-
-class SceneGuidance(nn.Module):
-    def __init__(self, grid_resolution: int, domain_extents: tuple, k: float, solver_iterations: int):
-        super().__init__()
-        self.grid_resolution = grid_resolution
-        self.domain_extents = domain_extents
-        self.k_squared = k**2
-        self.solver_iterations = solver_iterations
-        self.dx = (domain_extents[1] - domain_extents[0]) / (grid_resolution - 1)
-        self.laplacian_kernel = torch.tensor([[[[0, 1, 0], [1, 0, 1], [0, 1, 0]]]], dtype=torch.float32)
-
-    def _world_to_grid(self, coords: torch.Tensor) -> torch.Tensor:
-        x = torch.clamp(coords[..., 0], self.domain_extents[0], self.domain_extents[1])
-        y = torch.clamp(coords[..., 1], self.domain_extents[2], self.domain_extents[3])
-        return torch.stack([(x - self.domain_extents[0]) / self.dx, (y - self.domain_extents[2]) / self.dx], dim=-1).long()
-
-    def _solve_poisson(self, boundaries: torch.Tensor) -> torch.Tensor:
-        u = boundaries.clone()
-        is_boundary = (boundaries != 0.5)
-        denominator = 4.0 + self.k_squared * (self.dx**2)
-        kernel = self.laplacian_kernel.to(u.device)
-        for _ in range(self.solver_iterations):
-            u_laplacian = F.conv2d(u.unsqueeze(0).unsqueeze(0), kernel, padding=1).squeeze()
-            u_new = u_laplacian / denominator
-            u = torch.where(is_boundary, u, u_new)
-        return u
-
-    def forward(self, trajectory, goal, obstacles, map_points):
-        boundaries = torch.full((self.grid_resolution, self.grid_resolution), 0.5, device=trajectory.device)
-        map_coords = map_points.xy[map_points.valid]
-        is_solid = (map_points.types == MapPolylineType.LANE_BOUNDARY) & map_points.valid
-        if is_solid.any():
-            start = time.time()
-            solid_coords = self._world_to_grid(map_coords[is_solid[map_points.valid]])
-            boundaries[solid_coords[:, 1], solid_coords[:, 0]] = 0.0
-            end = time.time()
-            #print("Solid Boundary Time: ", end - start)
-        if obstacles.numel() > 0:
-            start = time.time()
-            obs_grid = self._world_to_grid(obstacles.view(-1, 2))
-            boundaries[obs_grid[:, 1], obs_grid[:, 0]] = 0.0
-            end = time.time()
-            #print("Obstacle Boundary Time: ", end - start)
-        start = time.time()
-        goal_grid = self._world_to_grid(goal)
-        end = time.time()
-        #print("Goal Grid Time: ", end - start)
-        boundaries[goal_grid[1], goal_grid[0]] = 1.0
-        start = time.time()
-        potential_field = self._solve_poisson(boundaries)
-        end = time.time()
-        ##print("Poisson Solve Time: ", end - start)
-        traj_norm_x = (trajectory[..., 0] - self.domain_extents[0]) / (self.domain_extents[1] - self.domain_extents[0]) * 2 - 1
-        traj_norm_y = (trajectory[..., 1] - self.domain_extents[2]) / (self.domain_extents[3] - self.domain_extents[2]) * 2 - 1
-        traj_normalized = torch.stack([traj_norm_x, traj_norm_y], dim=-1)
-        sampled_potentials = F.grid_sample(potential_field.unsqueeze(0).unsqueeze(0), traj_normalized.unsqueeze(0).unsqueeze(0), mode='bilinear', align_corners=True, padding_mode="border").squeeze()
-        return -torch.sum(sampled_potentials)
-    
-
-
-class DirectionalGuidance(nn.Module):
-    def __init__(self, penalty_weight: float):
-        super().__init__()
-        self.penalty_weight = penalty_weight
-
-    def forward(self, trajectories, initial_headings):
-        headings_norm = F.normalize(initial_headings, p=2, dim=-1)
-        displacement = trajectories[:, -1, :] - trajectories[:, 0, :]
-        left_vector = torch.stack([-headings_norm[:, 1], headings_norm[:, 0]], dim=-1)
-        left_drift = torch.einsum('ni,ni->n', displacement, left_vector)
-        energy_left = -left_drift + self.penalty_weight * F.relu(-left_drift)
-        energy_right = left_drift + self.penalty_weight * F.relu(left_drift)
-        return energy_left, energy_right
-
-class GuidanceController(nn.Module):
-    def __init__(self, grid_resolution: int, domain_extents: tuple, k: float, solver_iterations: int, drift_penalty_weight: float, receding_horizon_distance: float = 50.0):
-        super().__init__()
-        # Note: StraightLineGuidance is now used as a container for its helper methods and parameters
-        self.straight_guider_params = nn.Module()
-        self.straight_guider_params.grid_resolution = grid_resolution
-        self.straight_guider_params.domain_extents = domain_extents
-        self.straight_guider_params.k_squared = k**2
-        self.straight_guider_params.solver_iterations = solver_iterations
-        self.straight_guider_params.dx = (domain_extents[1] - domain_extents[0]) / (grid_resolution - 1)
-        self.straight_guider_params.laplacian_kernel = torch.tensor([[[[0, 1, 0], [1, 0, 1], [0, 1, 0]]]], dtype=torch.float32)
-
-        self.turn_guider = DirectionalGuidance(drift_penalty_weight)
-        self.receding_horizon_distance = receding_horizon_distance
-
-    def _world_to_grid_batched(self, coords: torch.Tensor) -> torch.Tensor:
-        # coords shape: [N, ..., 2]
-        x = torch.clamp(coords[..., 0], self.straight_guider_params.domain_extents[0], self.straight_guider_params.domain_extents[1])
-        y = torch.clamp(coords[..., 1], self.straight_guider_params.domain_extents[2], self.straight_guider_params.domain_extents[3])
-        grid_x = (x - self.straight_guider_params.domain_extents[0]) / self.straight_guider_params.dx
-        grid_y = (y - self.straight_guider_params.domain_extents[2]) / self.straight_guider_params.dx
-        return torch.stack([grid_x, grid_y], dim=-1).long()
-
-    def _solve_poisson_batched(self, boundaries_batch: torch.Tensor) -> torch.Tensor:
-        u = boundaries_batch.clone()
-        is_boundary = (boundaries_batch != 0.5)
-        denominator = 4.0 + self.straight_guider_params.k_squared * (self.straight_guider_params.dx**2)
-        kernel = self.straight_guider_params.laplacian_kernel.to(u.device)
-        for _ in range(self.straight_guider_params.solver_iterations):
-            u_laplacian = F.conv2d(u.unsqueeze(1), kernel, padding=1).squeeze(1)
-            u_new = u_laplacian / denominator
-            u = torch.where(is_boundary, u, u_new)
-        return u
-
-    def forward(self, agent_positions_flat, guidance_weights, initial_headings_flat, map_points, num_scenes, num_agents, num_intentions):
-        N = num_scenes * num_agents * num_intentions
-        
-        guidance_weights_flat = guidance_weights.view(N, 3)
-        w_lane, w_left, w_right = guidance_weights_flat.unbind(dim=-1)
-
-        energy_left, energy_right = self.turn_guider(agent_positions_flat, initial_headings_flat)
-        
-        energy_lane = torch.zeros(N, device=agent_positions_flat.device)
-        active_lane_indices = torch.where(w_lane > 1e-4)[0]
-
-        if active_lane_indices.numel() > 0:
-            # --- Step 1: Prepare Inputs for Active Trajectories ---
-            active_trajs = agent_positions_flat[active_lane_indices]
-            active_headings = initial_headings_flat[active_lane_indices]
-            
-            receding_goals = active_trajs[:, 0, :] + F.normalize(active_headings, p=2, dim=-1) * self.receding_horizon_distance
-            
-            # --- Step 2: Construct Boundary Grids in Parallel ---
-            num_active = active_lane_indices.shape[0]
-            boundaries_batch = torch.full((num_active, self.straight_guider_params.grid_resolution, self.straight_guider_params.grid_resolution), 0.5, device=agent_positions_flat.device)
-            
-            goal_coords_grid = self._world_to_grid_batched(receding_goals)
-            batch_indices = torch.arange(num_active, device=agent_positions_flat.device)
-            boundaries_batch[batch_indices, goal_coords_grid[:, 1], goal_coords_grid[:, 0]] = 1.0
-            
-            # --- Step 3: Solve all PDEs in Parallel ---
-            potential_fields = self._solve_poisson_batched(boundaries_batch)
-            
-            # --- Step 4: Sample Potentials in Parallel ---
-            traj_norm_x = (active_trajs[..., 0] - self.straight_guider_params.domain_extents[0]) / (self.straight_guider_params.domain_extents[1] - self.straight_guider_params.domain_extents[0]) * 2 - 1
-            traj_norm_y = (active_trajs[..., 1] - self.straight_guider_params.domain_extents[2]) / (self.straight_guider_params.domain_extents[3] - self.straight_guider_params.domain_extents[2]) * 2 - 1
-            traj_normalized = torch.stack([traj_norm_x, traj_norm_y], dim=-1) # Shape: [num_active, T, 2]
-            
-            sampled_potentials = F.grid_sample(potential_fields.unsqueeze(1), traj_normalized.unsqueeze(1), mode='bilinear', align_corners=True, padding_mode="border").squeeze()
-            energy_lane.scatter_(0, active_lane_indices, -torch.sum(sampled_potentials, dim=-1))
-
-        weighted_energy = w_lane * energy_lane + w_left * energy_left + w_right * energy_right
-        total_energy = torch.sum(weighted_energy)
-        
-        return total_energy
-
-
-
-def refine_with_edm_guidance(
-    policy_to_refine,
-    sigma_start,
-    denoiser_network,
-    lstm_prior_context,
-    mask,
-    guidance_scale=1.0,
-    num_steps=10,
-    sigma_min=0.002,
-    rho=7,
-):
-    """
-    Refines an existing trajectory using the guided EDM ODE sampler.
-    """
-    
-    # 1. Add a controlled amount of noise to the initial policy
-    #noise = torch.randn_like(policy_to_refine)
-    z_start = policy_to_refine.detach()
-
-    # 2. Define the time step discretization from sigma_start down to 0
-    step_indices = torch.arange(num_steps, device=policy_to_refine.device)
-    t_steps = (sigma_start ** (1 / rho) + step_indices / (num_steps - 1) * (sigma_min ** (1 / rho) - sigma_start ** (1 / rho))) ** rho
-    t_steps = torch.cat([t_steps, torch.zeros_like(t_steps[:1])])
-    
-    # 3. Initialize the trajectory with the noised-up policy
-    z_next = z_start
-    denoiser_network.eval()
-    # --- Main Refinement Loop ---
-    for i, (sigma_cur, sigma_next) in enumerate(zip(t_steps[:-1], t_steps[1:])):
-        z_cur = z_next
-
-        # Get the realism-based denoised prediction
-        with torch.no_grad():
-            denoised_uncond = denoiser_network(z_cur, sigma_cur, context_token=lstm_prior_context, key_padding_mask=~mask)
-
-        # Apply guidance to the denoised prediction
-
-        # Apply the gradient to steer the denoised output
-        #denoised_final = denoised_uncond - guidance_grad * guidance_scale
-        
-        # Perform the ODE solver step
-        d_cur = (z_cur - denoised_uncond) / sigma_cur
-        print(" AT t = ", i, " Guidance score: ", d_cur.norm().item())
-        z_next = z_cur + (sigma_next - sigma_cur) * d_cur
-
-    return z_next
-
-
-class PolicyRefinementModule(nn.Module):
-    def __init__(self, 
-                 hidden_size: int,
-                 num_agents: int = 288,
-                 beta_min: float = 0.1,
-                 beta_max: float = 20.0,
-                 sde_T_max: float = 1,
-                 sde_eps: float = 1e-2,
-                 ):
-        super().__init__()
-        tcn_channels = [hidden_size, 512, 512, hidden_size]
-        config = {
-            'latent_dim': 128,      # Should match your model's hidden_size
-            'seq_len': 10,           # The length of your trajectory sequences (e.g., your 'fixed T')
-            'nf': 128,               # Base number of features
-            'ch_mult': (1, 2, 2, 2), # Channel multiplier for each resolution
-            'num_res_blocks': 3,     # Number of res-blocks per resolution
-            'attn_resolutions': (16,), # Sequence lengths at which to apply attention (e.g., 10//(2**2) = 2)
-            'dropout': 0.1,
-            'resamp_with_conv': True
-        }
-        self.score_network = NCSNpp(config)
-        #self.score_network = TransformerScoreNetwork(latent_dim=hidden_size, context_dim=hidden_size)
-        self.gating_network = GatingNetwork(context_dim=hidden_size)
-        # --- 3. DECODERS & GUIDANCE MODELS (INSTANTIATED) ---
-        self.decoder_log_std = nn.Parameter(torch.zeros(2)) # For (x, y) or (vx, vy)
-        self.sde_T_max = sde_T_max
-        self.sde_eps = sde_eps
-    
-    # In your SeNeVAMLightningModule class
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gammas = self.gammas(cond)
+        betas = self.betas(cond)
+        return gammas * x + betas
 
 
 class PolicyAttentionBlock(nn.Module):
@@ -657,6 +220,7 @@ class PolicyNetwork(nn.Module):
         self,
         hidden_size: int,
         dropout: float = 0.1,
+        latent_c_dim: int = 32,
         num_blocks: int = 1,
         num_heads: Optional[int] = None,
         num_intentions: int = 6,
@@ -671,8 +235,9 @@ class PolicyNetwork(nn.Module):
         self.num_intentions = num_intentions
         self.num_neighbors = num_neighbors
         self.output_size = output_size
-        self.policy_refinement_module = PolicyRefinementModule(hidden_size = hidden_size)
         self.sigma_data = 0.5
+        self.latent_c_dim = latent_c_dim
+        self.film_layer = FiLMLayer(hidden_size, latent_c_dim)
         
 
         # create the intention embedding layer
@@ -728,6 +293,7 @@ class PolicyNetwork(nn.Module):
     def forward(
         self,
         inputs: torch.Tensor,
+        constraint_embed: torch.Tensor,
         tar_xy: torch.Tensor,
         tar_yaw: torch.Tensor,
         tar_valid: torch.Tensor,
@@ -840,6 +406,11 @@ class PolicyNetwork(nn.Module):
         assert torch.isnan(inputs).sum() == 0
         query = inputs + sa_pos_enc
 
+        B = tar_valid.shape[0] # Original batch size
+        c_embed_expanded = constraint_embed.unsqueeze(2).expand(-1, -1, k, -1)
+        c_embed_expanded = c_embed_expanded.reshape(B * l * k, -1)
+        query = self.film_layer(query, c_embed_expanded)
+
         # compute the top-k neighbors for each query point
         indices: torch.Tensor = get_topk_neighbors(
             target_xy=tar_xy,
@@ -908,7 +479,7 @@ class PolicyNetwork(nn.Module):
         assert torch.isnan(query).sum() == 0
         assert horizon > 0
         #print("QUERY RESHAPED: ", query.shape)
-        s_mean, s_var, sde_loss, score_loss, sde_metrics = self._gen_forward(x=query, horizon=horizon, emission_head=emission_head, context=context, map_context=map_context,
+        s_mean, s_var = self._gen_forward(x=query, horizon=horizon, emission_head=emission_head, context=context, map_context=map_context,
                                           tar_valid=tar_valid, assigned_types=assigned_types, scenario=scenario, global_step = global_step, batch_dims=batch_dims)
         s_mean = s_mean.reshape(*batch_dims, horizon, self.hidden_size)
         s_var = s_var.reshape(*batch_dims, horizon, self.hidden_size)
@@ -919,7 +490,7 @@ class PolicyNetwork(nn.Module):
         z_logits = self.z_proxy.forward(query)
         z_logits = z_logits.reshape(*batch_dims)
 
-        return s_mean, s_var, z_logits, sde_loss, score_loss, sde_metrics
+        return s_mean, s_var, z_logits
 
     def reset_parameters(self) -> None:
         """Reset the parameters of the policy network."""
@@ -959,12 +530,6 @@ class PolicyNetwork(nn.Module):
             self.generative_state_var.forward(x)
         )
         hx = (x.tanh().unsqueeze(0), torch.zeros_like(x).unsqueeze(0))
-        score_loss_aggregate = None
-        sde_loss_aggregate = None
-        sde_to_noisy_aggregate = None
-        noisy_to_gt_aggregate = None
-        mseloss = torch.nn.MSELoss()
-        start = time.time()
         counter = 0
         for t in range(1, horizon):
             #print("INSIDE FOR LOOP t: ", t)
@@ -977,49 +542,9 @@ class PolicyNetwork(nn.Module):
             out, hx = self.generative_lstm.forward(inp, hx=hx)
             out = out[..., -1, :]
             s_mean[..., t, :] = self.generative_state_mean.forward(out)
-            
-            if (t % refinement_steps == 0):
-                counter += 1
-                # Refine predicted trajectory latents using energy based models
-                policy = s_mean[..., t-10:t, :].clone()
-                
-                P_mean = -1.2
-                P_std = 1.2
-                sigma_start = torch.rand(1).to(policy.device)
-                sigma = torch.exp(sigma_start * P_std + P_mean).to(policy.device)
-                sigma_broadcast = sigma.view(-1, *([1] * (policy.dim() - 1)))
-                noise = torch.randn_like(policy)
-                z_t = policy + sigma_broadcast * noise
-                predicted_policy = self.policy_refinement_module.score_network(z_t, sigma, context_token=map_context, key_padding_mask=~tar_valid)
-                weight = (sigma**2 + self.sigma_data**2) / (sigma * self.sigma_data)**2
-                
-                score_losses = weight * ((predicted_policy - policy) ** 2)
-                
-                
-                if score_loss_aggregate is None:
-                    score_loss_aggregate = score_losses
-                    
-                else:
-                    score_loss_aggregate += score_losses
-
-                z_sde = refine_with_edm_guidance(z_t, sigma_start, self.policy_refinement_module.score_network, map_context, tar_valid)
-                if sde_loss_aggregate is None:
-                    sde_loss_aggregate = torch.nn.functional.mse_loss(z_sde, policy).mean()
-                    sde_to_noisy_aggregate = torch.nn.functional.cosine_similarity(z_sde, z_t, dim=-1).mean()
-                    noisy_to_gt_aggregate = torch.nn.functional.cosine_similarity(z_t, policy, dim=-1).mean()
-                else:
-                    sde_loss_aggregate += torch.nn.functional.mse_loss(z_sde, policy).mean()
-                    sde_to_noisy_aggregate += torch.nn.functional.cosine_similarity(z_sde, z_t, dim=-1).mean()
-                    noisy_to_gt_aggregate += torch.nn.functional.cosine_similarity(z_t, policy, dim=-1).mean()
-
-
-                sde_metrics = {"sde_to_lstm_mse": sde_loss_aggregate.item()/counter, "sde_to_noisy_cosine": sde_to_noisy_aggregate.item()/counter, "noisy_to_lstm_cosine": noisy_to_gt_aggregate.item()/counter}
-
-                
-                s_mean[..., t-10:t, :] = z_sde # COMMENT DURING TRAINING
 
             assert torch.isnan(s_mean).sum() == 0
             s_vars[..., t, :] = nn.functional.softplus(
                 self.generative_state_var.forward(out)
             )
-        return s_mean, s_vars, sde_loss_aggregate/counter, score_loss_aggregate/counter, sde_metrics
+        return s_mean, s_vars
