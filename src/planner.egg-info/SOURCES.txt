@@ -22,6 +22,8 @@ src/planner/data/components/av2_factories.py
 src/planner/model/__init__.py
 src/planner/model/senevam.py
 src/planner/model/components/__init__.py
+src/planner/model/components/constraint_models.py
+src/planner/model/components/constraints_loss.py
 src/planner/model/components/encoder.py
 src/planner/model/components/policy.py
 src/planner/model/components/tokenizer.py

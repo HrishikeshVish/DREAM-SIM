@@ -407,9 +407,18 @@ class PolicyNetwork(nn.Module):
         query = inputs + sa_pos_enc
 
         B = tar_valid.shape[0] # Original batch size
-        c_embed_expanded = constraint_embed.unsqueeze(2).expand(-1, -1, k, -1)
-        c_embed_expanded = c_embed_expanded.reshape(B * l * k, -1)
-        query = self.film_layer(query, c_embed_expanded)
+        # First, let's get the constraint embedding into a clean [B, L, C] shape.
+        # Your shape [4, 1, 1, 32] suggests it might be a global constraint per scene.
+        # We'll squeeze the unnecessary dimensions.
+        constraint_embed = constraint_embed.squeeze(2)
+        B, L, C = constraint_embed.shape
+        k = self.num_intentions
+        H = self.hidden_size
+        c_with_intent_dim = constraint_embed.unsqueeze(2)
+        c_expanded_intents = c_with_intent_dim.expand(-1, -1, k, -1)
+        c_final_shape = c_expanded_intents.reshape(B, L * k, C)
+        query = self.film_layer(query, c_final_shape)
+
 
         # compute the top-k neighbors for each query point
         indices: torch.Tensor = get_topk_neighbors(
@@ -479,6 +488,7 @@ class PolicyNetwork(nn.Module):
         assert torch.isnan(query).sum() == 0
         assert horizon > 0
         #print("QUERY RESHAPED: ", query.shape)
+
         s_mean, s_var = self._gen_forward(x=query, horizon=horizon, emission_head=emission_head, context=context, map_context=map_context,
                                           tar_valid=tar_valid, assigned_types=assigned_types, scenario=scenario, global_step = global_step, batch_dims=batch_dims)
         s_mean = s_mean.reshape(*batch_dims, horizon, self.hidden_size)

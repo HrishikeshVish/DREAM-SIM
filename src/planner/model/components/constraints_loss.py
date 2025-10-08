@@ -5,6 +5,9 @@ import numpy as np
 # Assume your dataclasses are importable
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 from planner.data.dataclass import MapPoint, ObjectProperty, Trajectory, MapPolylineType, Scenario
+from planner.model.function.mask import extract_target
+import torch.nn.functional as F
+import torch.distributions as D
 
 class GuidanceLoss(nn.Module):
     def forward(
@@ -91,7 +94,126 @@ class TargetSpeedLoss(GuidanceLoss):
         
         # Return the mean loss over the batch and agents
         return torch.mean(loss_per_agent)
-    
+
+class AgentCollisionMetrics(GuidanceLoss):
+    """
+    Computes a differentiable metric tensor for inter-agent collisions.
+    """
+    def __init__(self, num_disks: int = 5, buffer_dist: float = 0.2):
+        super().__init__()
+        self.num_disks = num_disks
+        self.buffer_dist = buffer_dist
+        # REMOVED: self.decay_rate is part of loss aggregation, not attribute calculation.
+
+    def _get_agent_disks(self, scenario: Scenario, is_target: torch.Tensor):
+        """
+        Helper to compute initial disk centroids and radii for all agents and timesteps.
+        """
+        ct = scenario.current_time_step
+
+        # --- This part is your verified code for extracting time-varying extents ---
+        # We slice the full future horizon from the log trajectory
+        future_length = scenario.log_trajectory.length[..., ct : -1]
+        future_width = scenario.log_trajectory.width[..., ct : -1]
+
+        extent_length, _ = extract_target(data=future_length, mask=is_target)
+        extent_width, _ = extract_target(data=future_width, mask=is_target)
+        
+        extents = torch.stack([extent_length, extent_width], dim=-1)
+        # Final extents shape: [B, N, T, 2]
+        
+        B, N, T, _ = extents.shape
+
+        # --- CORRECTED VECTORIZED LOGIC ---
+        # This part replaces the incorrect Python loop.
+
+        agt_rad = extents[..., 1] / 2.0      # Shape: [B, N, T]
+        cent_min = -(extents[..., 0] / 2.) + agt_rad  # Shape: [B, N, T]
+        cent_max = (extents[..., 0] / 2.) - agt_rad  # Shape: [B, N, T]
+
+        # 1. Create a linear interpolation tensor `t` for the disks.
+        #    Shape: [1, 1, 1, num_disks] for broadcasting.
+        t = torch.linspace(0, 1, self.num_disks, device=extents.device).view(1, 1, 1, -1)
+        
+        # 2. Linearly interpolate between cent_min and cent_max for each disk.
+        #    This is the vectorized equivalent of the nested loops.
+        #    unsqueeze(-1) adds a dimension for broadcasting with `t`.
+        cent_x = cent_min.unsqueeze(-1) * (1 - t) + cent_max.unsqueeze(-1) * t
+        # Final shape of cent_x: [B, N, T, num_disks]
+        
+        # 3. Stack to create the final local centroids.
+        centroids = torch.stack([cent_x, torch.zeros_like(cent_x)], dim=-1)
+        # Final shape of centroids: [B, N, T, num_disks, 2]
+        
+        return centroids, agt_rad
+
+    def forward(
+        self,
+        Y: torch.Tensor,
+        scenario: Scenario,
+        is_target: torch.Tensor,
+        # REMOVED: c_config and agt_mask are not needed for raw attribute calculation.
+    ) -> torch.Tensor:
+        """
+        Calculates a tensor of collision metrics.
+
+        Args:
+            Y: The trajectory to evaluate. Shape: [B, N, T, D].
+            scenario: The input Scenario object for agent extents.
+
+        Returns:
+            A tensor of shape [B, N, T] where each element is the
+            collision penalty/score for that agent at that timestep.
+        """
+        # --- Steps 1-4 for computing pairwise distances are unchanged ---
+        pos_pred, yaw_pred = Y[..., :2], Y[..., 4:5]
+        
+
+        B, N, T, _ = pos_pred.shape
+        local_centroids, agt_rad = self._get_agent_disks(scenario, is_target)
+        penalty_dists = agt_rad.unsqueeze(2) + agt_rad.unsqueeze(1) + self.buffer_dist
+        
+        # --- 2. Transform Disks to Global Frame (Vectorized) ---
+        s = torch.sin(yaw_pred).unsqueeze(-2)
+        c = torch.cos(yaw_pred).unsqueeze(-2)
+        rotM = torch.cat([c, -s, s, c], dim=-1).view(B, N, T, 1, 2, 2)
+        
+        # Rotate local centroids and add predicted global position
+        # The shapes are now consistent and allow for this broadcasted operation
+        world_centroids = (local_centroids.unsqueeze(-2) @ rotM).squeeze(-2) + pos_pred.unsqueeze(-2)
+        # Final world_centroids shape: [B, N, T, num_disks, 2]
+
+        # --- 3. Compute Pairwise Distances Efficiently (No Python loops) ---
+        # Prepare for pairwise comparison by adding dimensions for broadcasting
+        wc1 = world_centroids.unsqueeze(2)  # Shape: [B, N, 1, T, num_disks, 2]
+        wc2 = world_centroids.unsqueeze(1)  # Shape: [B, 1, N, T, num_disks, 2]
+
+        # Compute all disk-to-disk distances between all agent pairs at all timesteps
+        all_pair_distances = torch.linalg.norm(wc1.unsqueeze(5) - wc2.unsqueeze(4), dim=-1)
+        # Shape: [B, N, N, T, num_disks, num_disks]
+
+        # Find the minimum distance between any two disks of any two agents at each timestep
+        pair_dists = all_pair_distances.min(dim=-1).values.min(dim=-1).values
+        # Final pair_dists shape: [B, N, N, T]
+
+        # --- 4. Calculate Collision Penalty Tensor ---
+        no_self_collision_mask = ~torch.eye(N, device=Y.device, dtype=torch.bool).view(1, N, N, 1)
+        
+        # The shapes of pair_dists and penalty_dists now match perfectly
+        is_colliding = (pair_dists <= penalty_dists) & no_self_collision_mask
+        
+        penalties = 1.0 - (pair_dists / penalty_dists)
+        penalties = torch.where(is_colliding, torch.relu(penalties), torch.zeros_like(penalties))
+
+        # Sum penalties for each agent from all other agents
+        agent_penalties = torch.sum(penalties, dim=2) # Shape: [B, N, T]
+
+        # --- 5. Final Return ---
+        # Return the full per-agent, per-timestep attribute tensor.
+        pen_min = torch.min(agent_penalties)
+        pen_max = torch.max(agent_penalties)
+        agent_penalties = (agent_penalties - pen_min) / (pen_max - pen_min + 1e-6)
+        return agent_penalties
 
 class AgentCollisionLoss(GuidanceLoss):
     """
@@ -382,6 +504,119 @@ class TargetPosLoss(GuidanceLoss):
         num_valid_agents = torch.sum(valid_mask.float()).clamp(min=1.0)
         
         return torch.sum(loss_per_agent) / num_valid_agents
+    
+
+class VectorMapOffroadMetrics(GuidanceLoss):
+    """
+    Computes a differentiable off-road metric tensor using vectorized map polylines.
+    """
+    def __init__(self, lane_half_width: float = 2.0):
+        super().__init__()
+        self.lane_half_width = lane_half_width
+
+    def _point_to_segment_distance(self, p: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """
+        Calculates the minimum distance from a batch of points `p` to a batch of line segments `ab`.
+        (This helper function remains unchanged)
+        """
+        ab = b - a
+        ap = p - a
+        proj = torch.sum(ap * ab, dim=-1)
+        len_sq = torch.sum(ab * ab, dim=-1).clamp(min=1e-6)
+        t = (proj / len_sq).clamp(0.0, 1.0)
+        closest_point = a + t.unsqueeze(-1) * ab
+        return torch.linalg.norm(p - closest_point, dim=-1)
+
+    def forward(
+        self,
+        Y: torch.Tensor,
+        scenario: Scenario,
+        is_target: torch.Tensor,
+        # REMOVED: c_config and agt_mask are no longer needed here, as we are
+        # describing the raw physics of the given trajectory Y.
+    ) -> torch.Tensor:
+        """
+        Calculates a tensor of off-road metrics.
+
+        Args:
+            Y: The trajectory to evaluate. Shape: [B, N, T, D].
+            scenario: The input Scenario object containing map data.
+
+        Returns:
+            A tensor of shape [B, N, T] where each element represents the
+            off-road distance for that agent at that timestep.
+        """
+        
+        
+        ct  = scenario.current_time_step
+        
+        start_state_all = torch.cat([
+            scenario.log_trajectory.xy[..., ct, :],
+            scenario.log_trajectory.yaw[..., ct, None],
+            scenario.log_trajectory.velocity[..., ct, :]
+        ], dim=-1) # Shape: [B, N_max, 5]
+        start_state, _ = extract_target(data=start_state_all, mask=is_target)
+        integrated_displacements = torch.cumsum(Y, dim=2) # dim=2 is the time dimension
+        
+        Y = start_state.unsqueeze(2) + integrated_displacements
+        
+        agent_positions = Y[..., :2]
+        map_points = scenario.map_point
+        B, N, T, _ = agent_positions.shape
+        
+        
+        batch_offroad_errors = []
+
+        # Process each scene in the batch individually
+        for i in range(B):
+            scene_map = map_points[i]
+            lane_mask = (scene_map.types == MapPolylineType.LANE_CENTER_VEHICLE) & scene_map.valid
+            
+            # If no lanes, the off-road error is zero for all agents in this scene
+            if not torch.any(lane_mask):
+                batch_offroad_errors.append(torch.zeros(N, T, device=Y.device))
+                continue
+
+            lane_points = scene_map.xy[lane_mask]
+            lane_ids = scene_map.ids[lane_mask]
+
+            segments_a, segments_b = [], []
+            unique_ids = torch.unique(lane_ids)
+            for polyline_id in unique_ids:
+                polyline_points = lane_points[lane_ids == polyline_id]
+                if len(polyline_points) > 1:
+                    segments_a.append(polyline_points[:-1])
+                    segments_b.append(polyline_points[1:])
+            
+            # If no valid segments, error is zero
+            if not segments_a:
+                batch_offroad_errors.append(torch.zeros(N, T, device=Y.device))
+                continue
+
+            segments_a = torch.cat(segments_a, dim=0)
+            segments_b = torch.cat(segments_b, dim=0)
+
+            # --- Calculate Minimum Distance from Agents to Lane Segments ---
+            scene_agent_pos = agent_positions[i].unsqueeze(2) # Shape: [N, T, 1, 2]
+            segments_a = segments_a.view(1, 1, -1, 2)
+            segments_b = segments_b.view(1, 1, -1, 2)
+            
+            all_distances = self._point_to_segment_distance(scene_agent_pos, segments_a, segments_b)
+            min_dist_to_lane = torch.min(all_distances, dim=-1).values # Shape: [N, T]
+
+            # --- Compute Off-road Penalty ---
+            offroad_error = torch.relu(min_dist_to_lane - self.lane_half_width)
+            batch_offroad_errors.append(offroad_error)
+
+        # MODIFIED: Stack the results from each batch item to form the final tensor.
+        #           All loss aggregation logic has been removed.
+        batch_offroad_errors = torch.stack(batch_offroad_errors, dim=0)
+        #print("Before Batch offroad errors mean: ", torch.mean(batch_offroad_errors).item(), " max: ", torch.max(batch_offroad_errors).item(), " min: ", torch.min(batch_offroad_errors).item())
+        err_max = torch.max(batch_offroad_errors)
+        err_min = torch.min(batch_offroad_errors)
+        batch_offroad_errors = (batch_offroad_errors - err_min) / (err_max - err_min + 1e-6)
+        #print(" Batch offroad errors mean: ", torch.mean(batch_offroad_errors).item(), " max: ", torch.max(batch_offroad_errors).item(), " min: ", torch.min(batch_offroad_errors).item())
+        return batch_offroad_errors
     
 class VectorMapOffroadLoss(GuidanceLoss):
     """

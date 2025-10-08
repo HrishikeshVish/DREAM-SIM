@@ -15,6 +15,7 @@ from torch.optim.lr_scheduler import (
     
 )
 import pytorch_lightning as pl
+import torch.distributions as D
 from torchmetrics import MeanMetric, MetricCollection
 import torchsde
 import random
@@ -27,7 +28,7 @@ from planner.model.function.geometry import wrap_angles
 from planner.model.function.mask import extract_target
 from planner.model.module.layers import linear
 from planner.utils.logging import get_logger
-from planner.model.components.constraints_loss import DifferentiableConstraintLosses
+from planner.model.components.constraints_loss import DifferentiableConstraintLosses, AgentCollisionMetrics, VectorMapOffroadMetrics
 
 from planner.model.components.constraint_models import (
     ConstraintPosteriorNetwork,
@@ -35,20 +36,164 @@ from planner.model.components.constraint_models import (
     PotentialFieldNetwork
 )
 
-# Assume this is the file you've copied from the CCDiff repository
-# We will import the specific loss classes we want to adapt
-from your_project.third_party.ccdiff import AgentCollisionLoss, TargetSpeedLoss
-
-# Assume this is the adapter function we designed previously
-from your_project.utils.adapters import create_ccdiff_databatch
-
 import torch.nn.functional as F
-
+from typing import Any, Literal, Tuple
 # Constants
 TIKHONOV_REGULARIZATION = 0.5 / math.pi
 LOGGER = get_logger(__name__)
 
+def variance_scaling(
+    tensor: torch.Tensor,
+    scale: float = 1.0,
+    mode: Literal["fan_in", "fan_out", "fan_avg"] = "fan_in",
+    distribution: Literal["uniform", "normal", "truncated_normal"] = "normal",
+) -> None:
+    """Initialize the tensor in-place with variance scaling.
 
+    This function implements the variance scaling initialization method
+    as in the TensorFlow library :url:`https://www.tensorflow.org/api_docs/python/tf/keras/initializers/VarianceScaling` as well as in the JAX library :url:`https://jax.readthedocs.io/en/latest/_autosummary/jax.nn.initializers.variance_scaling.html`.
+
+    Args:
+        tensor (torch.Tensor): The input tensor to be initialized in-place.
+        scale (float, optional): The scaling factor (positive float).
+            Defaults to :math:`1.0`.
+        mode (Literal["fan_in", "fan_out", "fan_avg"], optional): One of the
+            `"fan_in"`, `"fan_out"`, or `"fan_avg"`. Defaults to `"fan_in"`.
+        distribution (Literal["uniform", "normal", "truncated_normal"],
+            optional): One of `"uniform"`, `"normal"`, or
+            `"truncated_normal"`. Defaults to "normal".
+    """
+    assert (
+        isinstance(scale, float) and scale >= 0.0
+    ), "The scale factor must be non-negative."
+    fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(tensor=tensor)
+    if mode == "fan_in":
+        n = fan_in
+    elif mode == "fan_out":
+        n = fan_out
+    elif mode == "fan_avg":
+        n = (fan_in + fan_out) / 2
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+    std = (max(1e-10, scale) / n) ** 0.5
+    if distribution == "uniform":
+        nn.init.uniform_(tensor, a=-std, b=std)
+    elif distribution == "normal":
+        nn.init.normal_(tensor, mean=0.0, std=std)
+    elif distribution == "truncated_normal":
+        a, b = -2.0 * std, 2.0 * std
+        nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=a, b=b)
+    else:
+        raise ValueError(f"Invalid distribution: {distribution}")
+    
+def linear(
+    in_features: int,
+    out_features: int,
+    init_scale: float = 1.0,
+    *args: Any,
+    **kwargs: Any,
+) -> nn.Linear:
+    """Create a linear layer with custom initialization.
+
+    Args:
+        in_features (int): The number of input features.
+        out_features (int): The number of output features.
+        init_scale (float): The scale factor for the initialization.
+        *args, **kwargs: Additional arguments for the linear layer.
+
+    Returns:
+        nn.Linear: The initialized linear layer.
+    """
+    layer = nn.Linear(in_features=in_features, out_features=out_features)
+    if hasattr(layer, "weight"):
+        variance_scaling(layer.weight, scale=init_scale)
+    if hasattr(layer, "bias"):
+        nn.init.constant_(layer.bias, val=0.0)
+
+    return layer
+
+@torch.jit.script
+def linear_gaussian_reconstruction_loss(
+    y: torch.Tensor,
+    x_vars: torch.Tensor,
+    y_mean: torch.Tensor,
+    weight: torch.Tensor,
+    y_vars: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute the analytical reconstruction loss for a linear Gaussian model.
+
+    Args:
+        y (torch.Tensor): Ground-truth observation.
+        x_vars (torch.Tensor): Variance vector of the latent variable.
+        y_mean (torch.Tensor): Mean vector of the emission distribution.
+        weight (torch.Tensor): Weight in the linear emission layer.
+        y_vars (Optional[torch.Tensor]): Variance vector of the emission
+            distribution. If `None`, ignore related terms. Defaults to `None`.
+
+    Returns:
+        torch.Tensor: The analytical reconstruction loss.
+    """
+    # sanity checks
+    n, d = weight.shape
+    if not y_mean.shape[-1] == n and x_vars.shape[-1] == d:
+        raise ValueError("Shape mismatched!")
+
+    if y_vars is None:
+        # NOTE: when y_vars is not provided, treat it as a identity matrix
+        # compute the mahalanobis term
+        mahalanobis = torch.sum(torch.square(y - y_mean), dim=-1)
+        
+
+        # compute the trace term
+        w = torch.einsum(
+            "ip, pj, btjq -> btiq", weight.T, weight, torch.diag_embed(x_vars)
+        )
+        trace = torch.sum(torch.diagonal(w, dim1=-2, dim2=-1), dim=-1)
+
+        return 0.5 * (mahalanobis + trace + n * math.log(2 * math.pi))
+    else:
+        # compute the log-normalizaer
+        log_normalizer = torch.sum(torch.log(2 * torch.pi * y_vars), dim=-1)
+
+        # compute the mahalanobis term
+        mahalanobis = torch.sum(torch.square(y - y_mean).div(y_vars), dim=-1)
+
+        # compute the trace term
+        _lt = torch.matmul(weight.t(), torch.diag_embed(1 / y_vars))
+        _rt = torch.matmul(weight, torch.diag_embed(x_vars))
+        trace = torch.sum(torch.diagonal(_lt @ _rt, dim1=-2, dim2=-1), dim=-1)
+
+        return 0.5 * (log_normalizer + mahalanobis + trace)
+
+class AttributeEmissionHead(nn.Module):
+    """
+    Decodes a latent embedding back into the physical attribute space.
+    This is used for the auxiliary reconstruction loss on the posterior network.
+    """
+    def __init__(self, hidden_size: int, attribute_dim: int):
+        super().__init__()
+        # A linear layer to predict the mean of the attributes
+        self.emission_mean = linear(hidden_size, attribute_dim, init_scale=1e-10)
+        
+        # A learnable parameter for the variance of the attributes
+        self.emission_vars = nn.Parameter(torch.zeros(attribute_dim), requires_grad=True)
+
+    def forward(self, fused_embedding: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            fused_embedding: The internal state of the posterior network.
+                             Shape: [B, N, HiddenSize].
+
+        Returns:
+            A tuple of (mean, variance) for the predicted attributes.
+        """
+        # Predict the mean of the attributes
+        y_mean_attr = self.emission_mean(fused_embedding)
+        
+        # Get the learnable variance, ensuring it's positive
+        y_vars_attr = torch.square(self.emission_vars) + 1e-2 # Tikhonov regularization
+        
+        return y_mean_attr, y_vars_attr
 
 # =============================================================================
 # Helper functions
@@ -90,6 +235,22 @@ class SeNeVAMOutput:
     """torch.Tensor: Current state of the predicted agents."""
     current_valid: torch.Tensor
     """torch.Tensor: Valid mask for the current state."""
+    p_c_mean: torch.Tensor
+    """torch.Tensor: Mean of the constraint prior distribution."""
+    p_c_var: torch.Tensor
+    """torch.Tensor: Variance of the constraint prior distribution."""
+    q_c_mean: torch.Tensor
+    """torch.Tensor: Mean of the constraint posterior distribution."""
+    q_c_var: torch.Tensor
+    """torch.Tensor: Variance of the constraint posterior distribution."""
+    emission_c_mean: torch.Tensor
+    """torch.Tensor: Mean of the attribute emission distribution."""
+    emission_c_var: torch.Tensor
+    """torch.Tensor: Variance of the attribute emission distribution."""
+    attribute_tensor: torch.Tensor
+    """torch.Tensor: The ground-truth attribute tensor."""
+    emission_weight: torch.Tensor
+    """torch.Tensor: The weight matrix of the attribute emission head."""
 
 
 @dataclass
@@ -171,6 +332,7 @@ class SeNeVAMLRScheduler(LRScheduler):
 
 class SeNeVAMLightningModule(LightningModule):
     """Implementation of `SeNeVA-M` model as a PyTorch Lightning module."""
+    _init_states: nn.Parameter
 
     def __init__(
         self,
@@ -218,12 +380,12 @@ class SeNeVAMLightningModule(LightningModule):
         self.constraint_posterior_net = ConstraintPosteriorNetwork(
             hidden_size=hidden_size,
             latent_c_dim=32,  # Must be the same as the prior network's
-            num_heads=num_heads
+            num_attributes=2,  # Number of constraint attributes (e.g., collision, offroad)
         )
         self.constraint_prior_net = ConstraintPriorNetwork(
             hidden_size=hidden_size,
             latent_c_dim=32,  # A new hyperparameter for your model
-            num_heads=num_heads
+            num_heads=2
         )
 
         self.potential_field_net = PotentialFieldNetwork(
@@ -231,12 +393,17 @@ class SeNeVAMLightningModule(LightningModule):
             latent_c_dim=32,         # Must match the other two networks
             traj_state_dim=5,        # The feature dimension of your predicted trajectory Y
             num_encoder_layers=3,    # Similar to `num_blocks` in your HistoryEncoder
-            num_heads=num_heads
+            num_heads=2
         )
+        
+        self.num_mixtures = 1
 
         self.constraint_losses = DifferentiableConstraintLosses()
         self.beta = 1.0
 
+        self.agent_collision_metric = AgentCollisionMetrics(num_disks=5, buffer_dist=0.2)
+        self.vector_map_offroad_metric = VectorMapOffroadMetrics(lane_half_width=2.0)
+        self.attribute_emission = AttributeEmissionHead(32, attribute_dim=2)
         
 
 
@@ -251,11 +418,8 @@ class SeNeVAMLightningModule(LightningModule):
                 "reconstruction": MeanMetric(),
                 "kl_div_z": MeanMetric(),
                 "z_proxy": MeanMetric(),
-                "sde_score_loss": MeanMetric(),
-                "sde_recon_loss": MeanMetric(),
-                "sde_to_lstm_mse": MeanMetric(),
-                "sde_to_noisy_cosine": MeanMetric(),
-                "noisy_to_lstm_cosine": MeanMetric()
+                "kl_div_c": MeanMetric(),
+                "emission_loss": MeanMetric(),
             }
         )
         metrics = MetricCollection(
@@ -265,10 +429,14 @@ class SeNeVAMLightningModule(LightningModule):
             }
         )
         self.train_metrics = metrics.clone(prefix="train/")
+        self._init_states = nn.Parameter(
+            torch.randn(2 * self.num_mixtures, 2 * hidden_size), requires_grad=True
+        )
+        self.reset_parameters()
 
 
     def forward(
-        self, scenario: Scenario, horizon: int, include_sdc: bool = True
+        self, scenario: Scenario, horizon: int, target: Optional[torch.Tensor] = None, include_sdc: bool = True
     ) -> SeNeVAMOutput:
         """Forward pass the backbone generative network.
 
@@ -293,10 +461,7 @@ class SeNeVAMLightningModule(LightningModule):
         )
 
         ct = scenario.current_time_step
-        #print("CURRENT TIME STEP:", ct)
-        #print("Horizons:", horizon)
-        #print("LOG TRAJECTORY SHAPE:", scenario.log_trajectory.shape)
-        # PART 1: ENCODING & TARGET EXTRACTION
+
         x_map, x_traj = self.encoder.forward(
             map_point=scenario.map_point,
             trajectory=scenario.log_trajectory,
@@ -304,85 +469,43 @@ class SeNeVAMLightningModule(LightningModule):
             current_time=scenario.current_time_step,
         )
 
-        _, x_future_gt = self.encoder(
-            map_point=scenario.map_point,
-            trajectory=scenario.log_trajectory,
-            properties=scenario.object_property,
-            # Pass future timesteps to the encoder
-            current_time=[scenario.current_time_step + 1, scenario.current_time_step + horizon],
-        )
+        is_target = get_target_mask(scenario=scenario, include_sdc=include_sdc)
 
-        q_c_dist = self.constraint_posterior_net(x_traj, x_future_gt)
-        p_c_dist = self.constraint_prior_net(x_traj)
-        c_sample = q_c_dist.rsample()
+        collision_attributes = self.agent_collision_metric(target, scenario, is_target)
+        offroad_attributes = self.vector_map_offroad_metric(target, scenario, is_target)
 
-
+        attribute_tensor = torch.stack(
+            [collision_attributes, offroad_attributes], 
+            dim=-1
+        ) # Final shape: [B, N, T, 2]
 
 
         assert x_map is not None and x_traj is not None
         assert torch.isnan(x_map).sum() == 0 and torch.isnan(x_traj).sum() == 0
-        #Linear interpolation in noise space. Intermediate noise will still yield correct positions.
-        #print("ENCODED TRAJECTORY SHAPE:", x_traj.shape)
-        #print("X_TRAJ SAMPLE:", x_traj.shape)
+
         
-        is_target = get_target_mask(scenario=scenario, include_sdc=include_sdc)
+        
         assert is_target is not None
         assert torch.isnan(is_target).sum() == 0
         x_tar, tar_valid = extract_target(data=x_traj, mask=is_target)
         assert x_tar is not None and tar_valid is not None
         assert torch.isnan(x_tar).sum() == 0 and torch.isnan(tar_valid).sum() == 0
         
-        # PART 2: SDE and DECODER LOSSES
+        q_c_mean, q_c_var = self.constraint_posterior_net(x_tar, attribute_tensor)
+        p_c_mean, p_c_var = self.constraint_prior_net(x_tar, x_map)
+        y_mean_attr, y_vars_attr = self.attribute_emission(q_c_mean)
+        emission_weight = self.attribute_emission.emission_mean.weight
         
-        #t = torch.ones(x_tar.shape[0], device=self.device)* (self.sde_T - self.sde_eps) + self.sde_eps ## DURING INFERENCE START FROM T=1
-        
-        # noise = torch.randn_like(x_tar)
-        # noise = torch.randn_like(x_tar)
-        # z_t = mean + std * noise
-        
-        # # Pass the NEGATION of tar_valid as the mask
-        # predicted_score = self.score_network(z_t, t, context_token=torch.mean(x_map, dim=1), key_padding_mask=~tar_valid)
-        # # Calculate the per-agent score matching loss
-        
-        # score_losses = ((predicted_score * std + noise)**2) * tar_valid.unsqueeze(-1)
+        #print("Q_C_MEAN SHAPE:", q_c_mean.shape)
+        #print("Attribute Tensor SHAPE:", attribute_tensor.shape)
+        #print("X_TAR SHAPE:", x_tar.shape)
         
         assert tar_valid.sum() > 0, "No valid target agents found for SDE loss calculation."
-        #loss_sde = score_losses.mean()
-        #losses = self.calculate_decoder_loss(x_tar, scenario, is_target, tar_valid)
-        #loss_sde = loss_sde + losses
-        #print("SDE LOSS: ", loss_sde.item(), " Score Loss: ", score_losses.sum().item(), " Decoder Loss: ", losses.item())
+
         
         num_agents_in_scene = tar_valid.shape[1] # This is the N for this batch
         gt_types_tar, _ = extract_target(scenario.object_property.object_types.unsqueeze(-1), is_target)
         assigned_types = gt_types_tar.squeeze(-1) # Shape: [B, N]
-        
-        #_, z_sde = self.sample_with_guidance(map_point=scenario.map_point, num_agents_to_gen=num_agents_in_scene, assigned_types=assigned_types, w_collision=1, w_layout=1, steps=100, noise_latent=z_t, t=t)
-        #assert z_sde.shape == x_tar.shape, f"Shape mismatch: z_sde {z_sde.shape}, x_tar {x_tar.shape}"
-        #loss_reconstruction = F.mse_loss(z_sde, x_tar)
-        
-            #x_tar = z_sde
-        #x_tar = z_sde
-
-        
-        
-
-        # --- 2. SDE Loss Calculation (The "Energy Optimizer") ---
-
-        # z_true = x_traj.detach() # Detach to prevent policy gradients from affecting SDE loss
-        # context = torch.mean(x_map.detach(), dim=1) # Use pooled map as context
-        # T = 1.0
-        # epsilon = 1e-5
-        # t = torch.rand(z_true.shape[0], device=self.device) * (T - epsilon) + epsilon
-        # mean, std = self.sde.marginal_prob(z_true, t)
-        # noise = torch.randn_like(z_true)
-        # z_t = mean + std * noise
-        # predicted_score = self.score_network(z_t, t, context)
-        # losses = (predicted_score * std + noise)**2
-        # loss_sde = torch.mean(losses)
-
-        #z_sde = self.sample_arrangement(x_map.detach(), num_agents=z_true.shape[1], arrangement_dim=z_true.shape[2])
-        # z_sde = self.sample_for_reconstruction(z_t.detach(), x_map.detach())
-        # loss_reconstruction = F.mse_loss(z_sde, z_true)
 
         # prepare the relative space-time features
         with torch.no_grad():
@@ -444,26 +567,24 @@ class SeNeVAMLightningModule(LightningModule):
             assigned_types = assigned_types,
             scenario = scenario,
             global_step = self.global_step,
-            constraint_embed = c_sample
+            constraint_embed = p_c_mean
         )
         
         assert s_mean is not None and s_vars is not None and z_logits is not None
         assert torch.isnan(s_mean).sum() == 0 
         assert torch.isnan(s_vars).sum() == 0 
         assert torch.isnan(z_logits).sum() == 0
-        # print("S_MEAN SHAPE:", s_mean.shape)
-        # print("S_VARS SHAPE:", s_vars.shape)
-        # exit()
+
 
         # forward pass the emission network
         weight = self.emission.weight
-        #print("BEFORE EMISSION: ", s_mean.shape, s_vars.shape)
+
         y_means = self.emission.forward(s_mean)
         y_covars = torch.matmul(
             torch.matmul(weight, torch.diag_embed(s_vars)),
             weight.T,
         )
-        #print("AFTER EMISSION: ", y_means.shape, y_covars.shape)
+
         end = time.time()
 
         assert y_means is not None and y_covars is not None
@@ -480,9 +601,15 @@ class SeNeVAMLightningModule(LightningModule):
             z_logits=z_logits,
             current_state=rst_tar,
             current_valid=tar_valid,
-            q_c_dist = q_c_dist,
-            p_c_dist = p_c_dist
-        )
+            p_c_mean=p_c_mean,
+            p_c_var=p_c_var,
+            q_c_mean=q_c_mean,
+            q_c_var=q_c_var, 
+            emission_c_mean = y_mean_attr,
+            emission_c_var = y_vars_attr,
+            attribute_tensor = attribute_tensor,
+            emission_weight = emission_weight
+        ), is_target
 
 
     def inference(self, scenario, horizon:int, num_samples:int=20, include_sdc:bool=True):
@@ -591,101 +718,114 @@ class SeNeVAMLightningModule(LightningModule):
         )
 
     def _compute_pde_loss(
-        self,
-        model_output: SeNeVAMOutput,
-        c_embed: torch.Tensor,
-        scenario: Scenario
+        self, 
+        model_output: Dict, 
+        scenario: Scenario,
+        is_target: torch.Tensor
+        
     ) -> torch.Tensor:
         """
         Calculates the PDE residual loss for the PINN framework.
 
-        This function enforces the governing PDE: ∇²Φ = ∇²L, where Φ is the
-        learned potential and L is the guidance loss from constraints.
+        This function enforces the governing PDE: -∇²Φ = L(Y), where Φ is the
+        learned potential and L is the sum of physical constraint violations.
         """
-        pde_loss_total = 0.0
-        num_modes = model_output.y_means.size(-3)
+        # Get the necessary outputs from the main model's forward pass
+        y_means = model_output.y_means
+        # We use the mean of the posterior `c` distribution for conditioning the potential field
+        c_embed = model_output.q_c_mean
 
-        # The PINN loss must apply to all plausible futures (modes) the model predicts
+        pde_loss_total = 0.0
+        num_modes = y_means.size(-3)
+        mse_loss = nn.MSELoss()
+
+        # The PINN loss must apply to the mean prediction of each trajectory mode
         for i in range(num_modes):
             # 1. Get the mean trajectory for the current mode
-            # This is the "answer" from the student (main model) that the teacher (PINN) will check
-            Y_i = model_output.y_means[..., i, :, :]
-            Y_i.requires_grad_(True)  # Crucial for computing gradients w.r.t. the trajectory
-
-            # 2. Calculate the LHS of the PDE: ∇²Φ
+            Y_i = y_means[..., i, :, :]
+            Y_i.requires_grad_(True)
+            # 2. Calculate the LHS of the PDE: -∇²Φ
             # Evaluate the potential field's energy for this trajectory
-            self.potential_field_net.train()  # Ensure the network is in training mode for autograd
-            phi_val = self.potential_field_net(Y_i, c_embed)
-            # Compute the Laplacian of the potential field
-            laplacian_phi = self._compute_laplacian(phi_val, Y_i)
+            with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+                phi_val = self.potential_field_net(Y_i, c_embed)
+                # Compute the Laplacian of the potential field
+                laplacian_phi = self._compute_laplacian(phi_val, Y_i)
 
-            # 3. Calculate the RHS of the PDE: f = ∇²L
-            # First, get the scalar guidance loss L(Y;c)
-            guidance_loss = self.constraint_losses(
-                Y=Y_i,
-                scenario=scenario
-                # c_config can be passed here if needed, e.g., for weights
-            )
-            # Then, compute its Laplacian to get the source term
-            source_term_f = self._compute_laplacian(guidance_loss, Y_i)
+                # 3. Calculate the RHS of the PDE: The Source Term L(Y)
+                #    First, compute the physical attribute tensor A(Y)
+                collision_attributes = self.agent_collision_metric(Y_i, scenario, is_target)
+                offroad_attributes = self.vector_map_offroad_metric(Y_i, scenario, is_target)
+                attribute_pred = torch.stack(
+                    [collision_attributes, offroad_attributes], 
+                    dim=-1
+                ) # Final shape: [B, N, T, 2]
+                
+                
+                #    Then, define the scalar loss L as the sum of all attribute violations.
+                #    This is our measure of "physical incorrectness".
+                guidance_loss_L = mse_loss(attribute_pred, model_output.attribute_tensor)
 
-            # 4. Compute the residual
-            # The residual is the difference between the two sides of the PDE.
-            # A perfect solution would have a residual of zero.
-            residual = laplacian_phi - source_term_f
-            
-            # 5. Accumulate the squared error loss
-            # We penalize the mean squared residual to drive it to zero.
-            pde_loss_total += torch.mean(residual**2)
+                # 4. Compute the residual for the equation: -∇²Φ = L
+                #    residual = (-laplacian_phi) - guidance_loss_L
+                residual = -laplacian_phi - guidance_loss_L
+                
+                # 5. Accumulate the squared error loss
+                pde_loss_total += torch.mean(residual**2)
 
-        # Average the loss over all modes
+        # Average the loss over all trajectory modes
         return pde_loss_total / num_modes
+
 
     def _compute_laplacian(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """
         Computes the Laplacian of a scalar output `y` w.r.t. a tensor input `x`.
+        Laplacian(y) = sum of the diagonal elements of the Hessian of y.
         
-        Laplacian(y) = sum over all elements of x (∂²y / ∂xᵢ²)
-
         Args:
-            y: Scalar tensor, output of a function (e.g., potential or loss). Shape: [B, 1]
-            x: Tensor input to the function. Shape: [B, ...]
+            y: Scalar tensor for each batch item. Shape: [B, 1]
+            x: Input tensor to the function that produced y. Shape: [B, ...]
 
         Returns:
-            Scalar tensor representing the Laplacian. Shape: [B]
+            A scalar Laplacian value for each batch item. Shape: [B]
         """
-        # First, compute the gradient of y w.r.t. x (the Jacobian)
+        B = y.shape[0]
+        
+        # 1. Compute the first gradient (the Jacobian vector)
+        #    `create_graph=True` is essential to build the graph for the second derivative.
         grad_y = torch.autograd.grad(
             outputs=y,
             inputs=x,
             grad_outputs=torch.ones_like(y),
-            create_graph=True  # create_graph=True is essential for second-order derivatives
-        )[0]
+            create_graph=True
+        )[0] # Shape is the same as x
 
-        # Flatten the gradient and input for easier iteration
-        grad_y_flat = grad_y.view(grad_y.size(0), -1)
-        x_flat = x.view(x.size(0), -1)
+        # 2. Iteratively compute the diagonal of the Hessian and sum to get the Laplacian
+        laplacian = torch.zeros(B, device=y.device)
+        
+        # Flatten the first gradient for easier iteration
+        flat_grad_y = grad_y.view(B, -1)
 
-        # Compute the second derivatives (diagonals of the Hessian)
-        # NOTE: This loop-based implementation is clear but can be slow for very high
-        # dimensional inputs. For production, this can be optimized using
-        # functorch or by computing Hessian-vector products.
-        laplacian = 0.0
-        for i in range(grad_y_flat.size(1)):
-            # Compute the gradient of the i-th element of the first gradient
-            # w.r.t. the full input vector x
-            grad2_i = torch.autograd.grad(
-                outputs=grad_y_flat[:, i],
-                inputs=x_flat,
-                grad_outputs=torch.ones_like(grad_y_flat[:, i]),
-                create_graph=True
+        for i in range(flat_grad_y.shape[1]):
+            # Compute the gradient of the i-th component of the first gradient vector.
+            # This gives us the i-th COLUMN of the Hessian matrix.
+            grad2_column_i = torch.autograd.grad(
+                outputs=flat_grad_y[:, i],
+                # CRUCIAL FIX: Always differentiate w.r.t. the original tensor `x`
+                # to preserve the computation graph.
+                inputs=x,
+                grad_outputs=torch.ones_like(flat_grad_y[:, i]),
+                retain_graph=True # We must retain the graph for the next iteration of the loop
             )[0]
-            # We only need the diagonal term ∂²y/∂xᵢ², which is the i-th element
-            laplacian += grad2_i[:, i]
             
-        return laplacian     
+            # We only need the diagonal term (the i-th element of the i-th column).
+            # We add it to our running sum for the Laplacian.
+            laplacian += grad2_column_i.view(B, -1)[:, i]
+            
+        return laplacian   
 
-
+    def reset_parameters(self) -> None:
+        """Reset the parameters of the generative network."""
+        variance_scaling(self._init_states)
 
     # =========================================================================
     # LightningModule hooks
@@ -797,7 +937,7 @@ class SeNeVAMLightningModule(LightningModule):
         target, valid = self.get_target(scenario=batch)
         horizon = target.size(-2)
 
-        output = self.forward(scenario=batch, horizon=horizon)
+        output, is_target = self.forward(scenario=batch, horizon=horizon, target=target)
         losses = self._compute_losses(
             y_obs=target,
             valid=valid,
@@ -807,15 +947,23 @@ class SeNeVAMLightningModule(LightningModule):
             # NOTE: only train proxy network after training generative model
             train_proxy=self.global_step
             >= 0.5 * self.optimizer_config.total_steps,
-            q_c_dist=output.q_c_dist,
-            p_c_dist=output.p_c_dist
+            p_c_mean=output.p_c_mean,
+            p_c_vars=output.p_c_var,
+            q_c_mean=output.q_c_mean,
+            q_c_vars=output.q_c_var,
+            c_emission_mean=output.emission_c_mean,
+            c_emission_var=output.emission_c_var,
+            emission_weight=output.emission_weight,
+            attribute_tensor=output.attribute_tensor
+            
         )
-        pde_loss = self._compute_pde_loss(
-            model_output=output,
-            scenario=batch # Pass the full scenario for context
-        )
-        losses = losses + self.beta * pde_loss
-        losses["pde_loss"] = pde_loss.item()
+        # pde_loss = self._compute_pde_loss(
+        #     model_output=output,
+        #     scenario=batch, # Pass the full scenario for context
+        #     is_target=is_target
+        # )
+        losses["loss"] = losses["loss"] #+ 0.0001 * pde_loss
+        #losses["pde_loss"] = pde_loss.item()
         _batch_time = time.monotonic() - _start_time
 
         # Log training status
@@ -891,8 +1039,14 @@ class SeNeVAMLightningModule(LightningModule):
         y_covar: torch.Tensor,
         z_logits: torch.Tensor,
         # MODIFIED: Add the distributions for the latent constraint `c` to the signature
-        q_c_dist: D.Distribution,
-        p_c_dist: D.Distribution,
+        p_c_mean: torch.Tensor,
+        p_c_vars: torch.Tensor,
+        q_c_mean: torch.Tensor,
+        q_c_vars: torch.Tensor,
+        c_emission_mean: torch.Tensor,
+        c_emission_var: torch.Tensor,
+        emission_weight: torch.Tensor,
+        attribute_tensor: torch.Tensor,
         train_proxy: bool = False
     ) -> Dict[str, torch.Tensor]:
         
@@ -942,23 +1096,95 @@ class SeNeVAMLightningModule(LightningModule):
 
         # step 5: calculate the KL divergence for the latent constraint c
         # This term regularizes the constraint embedding space.
-        kl_div_c = D.kl.kl_divergence(q_c_dist, p_c_dist)
+        kl_div_c = self._compute_constraint_kl_loss(
+            q_c_mean=q_c_mean,
+            q_c_vars=q_c_vars,
+            p_c_mean=p_c_mean,
+            p_c_vars=p_c_vars
+        )
 
         # --- Combine all losses ---
         
         # MODIFIED: Add the original losses and the new, weighted kl_div_c
         # Note: You will need to add `self.kl_c_weight` as a hyperparameter
         #       in your model's __init__ (e.g., self.kl_c_weight = 0.1)
-        loss = loss + float(train_proxy) * z_proxy_loss + self.kl_c_weight * kl_div_c
+        loss = loss + float(train_proxy) * z_proxy_loss + kl_div_c
+
+        emission_loss = linear_gaussian_reconstruction_loss(
+            y=attribute_tensor, # Use aggregated attributes as target
+            x_vars=q_c_vars,
+            y_mean=c_emission_mean,
+            y_vars=c_emission_var,
+            weight=emission_weight
+        ).sum(dim=-1).mean() # Sum over attributes and average over batch/agents
+
+        loss = loss + 0.01 * emission_loss
+
         
         # MODIFIED: Add kl_div_c to the returned dictionary for logging
         return {
             "loss": loss[valid.any(dim=-1)].mean(),
             "reconstruction": loss[valid.any(dim=-1)].mean().detach(),
             "kl_div_z": kl_div_z[valid.any(dim=-1)].mean().detach(),
-            "kl_div_c": kl_div_c[valid.any(dim=-1)].mean().detach(), # New log item
+            "kl_div_c": kl_div_c.mean().detach(), # New log item
             "z_proxy": z_proxy_loss[valid.any(dim=-1)].mean().detach(),
+            "emission_loss": emission_loss.detach()
+
         }
+    
+
+    def _compute_constraint_kl_loss(
+        self,
+        q_c_mean: torch.Tensor, # Posterior mean
+        q_c_vars: torch.Tensor, # Posterior variance
+        p_c_mean: torch.Tensor, # Prior mean
+        p_c_vars: torch.Tensor, # Prior variance
+    ) -> torch.Tensor:
+        """
+        Computes the hierarchical KL divergence for a Mixture of Gaussians latent space.
+        KL( q(z,c|x,y) || p(z,c|x) ) = E_q(z|x,y)[ KL( q(c|x,y,z) || p(c|x,z) ) ] + KL( q(z|x,y) || p(z|x) )
+        """
+        
+        def _evaluate_z(prior_mean, prior_vars, posterior_mean, posterior_vars, num_mixtures):
+            """Computes the optimal posterior over the mixture components, q(z|x,y)."""
+            # Using log-sum-exp trick for stability, this is equivalent to your version
+            # This calculates KL(q(c|x,y,z) || p(c|x,z)) for each component z
+            kl_per_component = 0.5 * (
+                torch.sum(torch.log(prior_vars) - torch.log(posterior_vars), dim=-1) +
+                torch.sum(posterior_vars / prior_vars, dim=-1) +
+                torch.sum((posterior_mean - prior_mean)**2 / prior_vars, dim=-1) -
+                prior_mean.shape[-1]
+            )
+            
+            # The optimal q(z) is softmax of the negative KL
+            log_q_z = F.log_softmax(-kl_per_component, dim=-1)
+            return torch.exp(log_q_z)
+
+        # 1. Compute the optimal posterior over mixture components, q(z|x,y)
+        with torch.no_grad():
+            q_z = _evaluate_z(p_c_mean, p_c_vars, q_c_mean, q_c_vars, self.num_mixtures)
+
+        # 2. Compute KL divergence of the categorical latent `z`
+        #    Assumes a uniform prior over mixtures: p(z) = 1/K
+        uniform_prior_log_prob = -math.log(self.num_mixtures)
+        kl_div_z = torch.sum(q_z * (torch.log(q_z + 1e-9) - uniform_prior_log_prob), dim=-1)
+        
+        # 3. Compute the expected KL divergence of the continuous latent `c`
+        #    Create distribution objects for the KL calculation
+        p_dist = D.MultivariateNormal(loc=p_c_mean, covariance_matrix=torch.diag_embed(p_c_vars + 1e-6))
+        q_dist = D.MultivariateNormal(loc=q_c_mean, covariance_matrix=torch.diag_embed(q_c_vars + 1e-6))
+        
+        # kl_div_s is the KL for each component: [B, N, NumMixtures]
+        kl_div_s = D.kl.kl_divergence(q_dist, p_dist)
+        assert torch.isnan(kl_div_s).sum() == 0
+        
+        # Expectation of KL_s over q(z)
+        expected_kl_div_s = torch.sum(q_z * kl_div_s, dim=-1)
+        
+        # 4. Total KL is the sum of the two parts, averaged over batch and agents
+        total_kl_div = torch.mean(kl_div_z + expected_kl_div_s)
+        
+        return total_kl_div
 
     # =========================================================================
     # static methods

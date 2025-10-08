@@ -19,9 +19,9 @@ def extract_target(
         Tuple[torch.Tensor, torch.Tensor]: The extracted target data and valid
             mask of shape ``(*, M, D)`` and ``(*, M)``, respectively.
     """
-    # print("MASK SHAPE:", mask.shape)
+    #print("MASK SHAPE:", mask.shape)
     # flatten the batch dimensions
-    # print("DATA SHAPE:", data.shape)
+    ##print("DATA SHAPE:", data.shape)
     batch_shape = mask.shape[:-1]
     seq_length = mask.shape[-1]
     dim = data.shape[-1]
@@ -56,5 +56,4 @@ def extract_target(
             valid_indices = batch_indices[valid_batch]
             output[valid_indices, i] = flat_data[valid_indices, idx]
             valid[valid_indices, i] = True
-
     return output, valid
